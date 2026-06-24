@@ -1,0 +1,55 @@
+name: Node Backend Check Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: supersecretpassword
+          POSTGRES_DB: poc_auth_db
+        ports:
+          - 5432:5432
+      mongodb:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+      redis:
+        image: redis:7.0-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Use Node.js 18.x
+      uses: actions/setup-node@v3
+      with:
+        node-version: 18.x
+        cache: 'npm'
+
+    - name: Setup System Environment Configurations
+      run: |
+        echo "PORT=3000" >> .env
+        echo "JWT_SECRET=test_secret_string" >> .env
+        echo "MONGO_URI=mongodb://localhost:27017/test_db" >> .env
+        echo "PG_URI=postgresql://admin:supersecretpassword@localhost:5432/poc_auth_db" >> .env
+        echo "REDIS_URL=redis://localhost:6379" >> .env
+
+    - name: Dependencies installation
+      run: npm ci
+
+    - name: Typecheck validation compile
+      run: npm run build
+
+    - name: Run Test Execution Matrixes
+      run: npm test
