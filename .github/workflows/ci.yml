@@ -2,9 +2,9 @@ name: Node Backend Check Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ prod, dev ]
   pull_request:
-    branches: [ main ]
+    branches: [ prod ]
 
 jobs:
   build-and-test:
