@@ -2,8 +2,9 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
-  // Load environment variables BEFORE any test files are imported
   setupFiles: ['dotenv/config'],
+  // 1. ADD THIS LINE: Tells Jest to run our crypto polyfill before tests
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'], 
   roots: ['<rootDir>/tests'],
   testPathIgnorePatterns: [
     '/node_modules/',
