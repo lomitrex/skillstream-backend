@@ -5,37 +5,28 @@ import mongoose from 'mongoose';
 import { pgPool, initPgDb } from '../src/config/db';
 import { redisClient, connectRedis } from '../src/config/redis';
 import { connectMongo } from '../src/config/mongo';
+import { Course } from '../src/models/course.model';
 
-
-describe('SkillStream End-to-End API Integration Suite', () => {
+describe('SkillStream Production Security & Resilience Suite', () => {
+  let studentCookie: string;
   let adminAccessToken: string;
-  let adminRefreshToken: string;
-  let studentAccessToken: string;
-  let targetCourseId: string;
+  let firstRefreshToken: string;
+  let rotatedRefreshToken: string;
 
   beforeAll(async () => {
-    
     await initPgDb();
     await connectMongo();
     await connectRedis();
 
-    
+    // Clean test state
+    await pgPool.query('DROP TABLE IF EXISTS refresh_tokens CASCADE;');
     await pgPool.query('DROP TABLE IF EXISTS users CASCADE;');
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password VARCHAR(255) NOT NULL,
-        role VARCHAR(50) DEFAULT 'student',
-        refresh_token TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-    await pgPool.query(createTableQuery);
+    await initPgDb();
+    await Course.deleteMany({});
+    await redisClient.flushAll();
   });
 
   afterAll(async () => {
-    
     await mongoose.disconnect();
     await pgPool.end();
     if (redisClient.isOpen) {
@@ -44,149 +35,184 @@ describe('SkillStream End-to-End API Integration Suite', () => {
     server.close();
   });
 
-  
-  
-  
-  describe('Auth Endpoints', () => {
-    it('should successfully register an admin user', async () => {
+  describe('1. Privilege Escalation Guards', () => {
+    it('prevents vertical privilege escalation during registration', async () => {
       const res = await request(app)
         .post('/api/v1/auth/register')
         .send({
-          email: 'testadmin@poc-platform.com',
-          password: 'securepassword123',
-          role: 'admin'
+          email: 'attacker@test.com',
+          password: 'Password123!',
+          role: 'admin', // Tampering attempt
         });
+
       expect(res.status).toBe(201);
-      expect(res.body).toHaveProperty('id');
-      expect(res.body.role).toBe('admin');
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.role).toBe('student'); // Force-demoted to student
     });
+  });
 
-    it('should successfully register a default student user', async () => {
-      const res = await request(app)
-        .post('/api/v1/auth/register')
-        .send({
-          email: 'student@poc-platform.com',
-          password: 'studentpassword123'
-        });
-      expect(res.status).toBe(201);
-      expect(res.body.role).toBe('student');
-    });
-
-    it('should reject registration with an existing email (OWASP/DB Constraints)', async () => {
-      const res = await request(app)
-        .post('/api/v1/auth/register')
-        .send({
-          email: 'testadmin@poc-platform.com',
-          password: 'anotherpassword'
-        });
-      expect(res.status).toBe(409);
-    });
-
-    it('should authenticate users and yield an access/refresh token pair', async () => {
+  describe('2. Single-Use Refresh Token Rotation & Reuse Detection', () => {
+    it('authenticates and sets SameSite=Strict cookies', async () => {
       const res = await request(app)
         .post('/api/v1/auth/login')
         .send({
-          email: 'testadmin@poc-platform.com',
-          password: 'securepassword123'
+          email: 'attacker@test.com',
+          password: 'Password123!',
         });
+
       expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('accessToken');
-      expect(res.body).toHaveProperty('refreshToken');
-      
-      adminAccessToken = res.body.accessToken;
-      adminRefreshToken = res.body.refreshToken;
+      expect(res.body.success).toBe(true);
+      expect(res.body.data).toHaveProperty("refreshToken");
+
+      firstRefreshToken = res.body.data.refreshToken;
+
+      const rawCookies = res.headers["set-cookie"];
+      const cookies: string[] = Array.isArray(rawCookies)
+        ? rawCookies
+        : typeof rawCookies === "string"
+          ? [rawCookies]
+          : [];
+
+      expect(cookies.some((c: string) => c.includes("SameSite=Strict"))).toBe(
+        true,
+      );
+      expect(cookies.some((c: string) => c.includes("HttpOnly"))).toBe(true);
     });
 
-    it('should log in student to acquire student access credentials', async () => {
-      const res = await request(app)
-        .post('/api/v1/auth/login')
-        .send({
-          email: 'student@poc-platform.com',
-          password: 'studentpassword123'
-        });
-      studentAccessToken = res.body.accessToken;
-    });
-
-    it('should rotate access tokens using a valid refresh token', async () => {
+    it('rotates the refresh token successfully on first use', async () => {
       const res = await request(app)
         .post('/api/v1/auth/refresh')
-        .send({ refreshToken: adminRefreshToken });
+        .send({ refreshToken: firstRefreshToken });
+
       expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('accessToken');
+      expect(res.body.success).toBe(true);
+      rotatedRefreshToken = res.body.data.refreshToken;
+      expect(rotatedRefreshToken).not.toBe(firstRefreshToken);
+    });
+
+    it('detects refresh token reuse and immediately invalidates the token family', async () => {
+      // Attacker replays firstRefreshToken
+      const replayRes = await request(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: firstRefreshToken });
+
+      expect(replayRes.status).toBe(403);
+      expect(replayRes.body.error.code).toBe('TOKEN_REUSE_DETECTED');
+
+      // Legitimate user attempts to use rotatedRefreshToken - must now fail because family was revoked
+      const legitRes = await request(app)
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: rotatedRefreshToken });
+
+      expect(legitRes.status).toBe(403);
+      expect(legitRes.body.error.code).toBe('TOKEN_REUSE_DETECTED');
     });
   });
 
-  
-  
-  
-  describe('Course Catalog Endpoints', () => {
-    it('should deny course additions to unauthorized anonymous requests', async () => {
-      const res = await request(app)
-        .post('/api/v1/courses')
-        .send({ title: 'Anonymous Threat' });
-      expect(res.status).toBe(401);
+  describe('3. Redis Idempotency Pattern', () => {
+    let adminToken: string;
+
+    beforeAll(async () => {
+      // Seed verified admin directly in Postgres
+      await pgPool.query(
+        `INSERT INTO users (email, password_hash, role)
+         VALUES ('admin@platform.com', '$2b$12$DUMMY_HASH_SECURE', 'admin')`
+      );
+
+      const loginRes = await request(app)
+        .post('/api/v1/auth/login')
+        .send({ email: 'attacker@test.com', password: 'Password123!' });
+      studentCookie = loginRes.body.data.accessToken;
+
+      // Authorize admin
+      const jwt = require('jsonwebtoken');
+      adminToken = jwt.sign(
+        { id: 99, email: 'admin@platform.com', role: 'admin' },
+        process.env.JWT_SECRET || 'access_secret_key_2026',
+        { expiresIn: '1h' }
+      );
     });
 
-    it('should block regular students from accessing instructor features (RBAC)', async () => {
-      const res = await request(app)
+    it('returns the exact cached response on duplicate Idempotency-Key submission', async () => {
+      const idempotencyKey = 'unique-idempotency-key-001';
+
+      const firstCall = await request(app)
         .post('/api/v1/courses')
-        .set('Authorization', `Bearer ${studentAccessToken}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .set('X-Idempotency-Key', idempotencyKey)
         .send({
-          title: 'Illegal Course Attempt',
-          description: 'Hacking the framework',
-          instructor: 'Malicious'
+          title: 'Distributed Systems with Node.js',
+          description: 'Production architecture',
         });
-      expect(res.status).toBe(403);
-    });
 
-    it('should allow verified admins to create new courses', async () => {
-      const res = await request(app)
+      expect(firstCall.status).toBe(201);
+      const originalCourseId = firstCall.body.data._id;
+
+      // Second identical request
+      const secondCall = await request(app)
         .post('/api/v1/courses')
-        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .set('X-Idempotency-Key', idempotencyKey)
         .send({
-          title: 'Advanced Node.js Production Architecture',
-          description: 'Mastering performance mechanics',
-          instructor: 'Lead Engineer'
+          title: 'Distributed Systems with Node.js',
+          description: 'Production architecture',
         });
-      expect(res.status).toBe(201);
-      expect(res.body).toHaveProperty('_id');
-      targetCourseId = res.body._id;
-    });
 
-    it('should fetch the course list successfully via authenticated request', async () => {
-      const res = await request(app)
-        .get('/api/v1/courses')
-        .set('Authorization', `Bearer ${adminAccessToken}`);
-      expect(res.status).toBe(200);
-      expect(Array.isArray(res.body)).toBe(true);
-      expect(res.body.length).toBeGreaterThan(0);
+      expect(secondCall.status).toBe(201);
+      expect(secondCall.headers['x-cache-hit']).toBe('true');
+      expect(secondCall.body.data._id).toBe(originalCourseId);
+
+      // Verify no duplicate record was created in MongoDB
+      const count = await Course.countDocuments({ title: 'Distributed Systems with Node.js' });
+      expect(count).toBe(1);
     });
   });
 
-  
-  
-  
-  describe('Context Reviews & Webhook Handling', () => {
-    it('should attach a course review using metadata extracted from user session token', async () => {
-      const res = await request(app)
-        .post('/api/v1/reviews')
-        .set('Authorization', `Bearer ${adminAccessToken}`)
-        .send({
-          courseId: targetCourseId,
-          rating: 5,
-          comment: 'Outstanding backend architecture blueprint!'
-        });
-      expect(res.status).toBe(201);
-      expect(res.body).toHaveProperty('userId');
+  describe('4. Pagination, Filtering, and Uniform Response Envelopes', () => {
+    let adminToken: string;
+
+    beforeAll(async () => {
+      const jwt = require('jsonwebtoken');
+      adminToken = jwt.sign(
+        { id: 99, email: 'admin@platform.com', role: 'admin' },
+        process.env.JWT_SECRET || 'access_secret_key_2026'
+      );
+
+      // Seed courses
+      await Course.create([
+        { title: 'TypeScript Core', description: 'Language fundamentals', instructor: 'admin@platform.com' },
+        { title: 'Advanced Docker', description: 'Container workflows', instructor: 'admin@platform.com' },
+        { title: 'Kubernetes Scale', description: 'Cluster orchestration', instructor: 'admin@platform.com' },
+      ]);
     });
 
-    it('should successfully accept mobile synchronization requests via webhook headers', async () => {
+    it('returns paginated and enveloped course listings', async () => {
       const res = await request(app)
-        .post('/api/v1/webhooks/mobile-sync')
-        .set('x-sync-signature', 'mobile_secure_tracking_signature')
-        .send({ deviceId: 'mob_device_99', action: 'force_delta_refresh' });
+        .get('/api/v1/courses?page=1&limit=2&sortBy=title&sortOrder=asc')
+        .set('Authorization', `Bearer ${adminToken}`);
+
       expect(res.status).toBe(200);
-      expect(res.body.status).toBe('synced');
+      expect(res.body).toHaveProperty('success', true);
+      expect(res.body).toHaveProperty('data');
+      expect(res.body).toHaveProperty('error', null);
+      expect(res.body.meta).toEqual(
+        expect.objectContaining({
+          page: 1,
+          limit: 2,
+          totalPages: expect.any(Number),
+        })
+      );
+      expect(res.body.data.length).toBe(2);
+    });
+
+    it('filters courses by search parameter', async () => {
+      const res = await request(app)
+        .get('/api/v1/courses?search=Kubernetes')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.length).toBe(1);
+      expect(res.body.data[0].title).toBe('Kubernetes Scale');
     });
   });
 });

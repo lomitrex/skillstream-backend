@@ -1,13 +1,18 @@
 import { Router } from 'express';
-import { CourseController } from '../controllers/course.controller';
-import { authenticateToken, authorizeRoles } from '../middleware/auth.middleware';
-import multer from 'multer';
+import { listCourses, createCourse } from '../controllers/course.controller';
+import { authenticate } from '../middleware/auth.middleware';
+import { authorizeRoles } from '../middleware/role.middleware';
+import { idempotencyGuard } from '../middleware/idempotency.middleware';
 
-const upload = multer({ dest: 'uploads/' });
 const router = Router();
 
-router.post('/', authenticateToken, authorizeRoles('admin', 'instructor'), CourseController.create);
-router.get('/', authenticateToken, CourseController.getAll);
-router.post('/:id/thumbnail', authenticateToken, authorizeRoles('admin'), upload.single('thumbnail'), CourseController.uploadThumbnail);
+router.get('/', authenticate, listCourses);
+router.post(
+  '/',
+  authenticate,
+  authorizeRoles('admin', 'instructor'),
+  idempotencyGuard(3600),
+  createCourse
+);
 
 export default router;

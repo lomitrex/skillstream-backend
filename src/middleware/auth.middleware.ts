@@ -1,42 +1,34 @@
-import { NextFunction, Request, Response } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { sendError } from '../utils/response';
 
-declare global {
-  namespace Express {
-    interface Request {
-      user?: {
-        id: number;
-        email: string;
-        role: string;
-      };
-    }
-  }
+interface JwtPayload {
+  id: number;
+  email: string;
+  role: string;
 }
 
-export const authenticateToken = (req: Request, res: Response, next: NextFunction): void => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+export const authenticate = (req: Request, res: Response, next: NextFunction): void => {
+  const authHeader = req.headers.authorization;
+  const cookieToken = req.cookies?.access_token;
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.split(' ')[1]
+    : cookieToken;
 
   if (!token) {
-    res.status(401).json({ error: 'Access token required' });
+    sendError(res, 401, 'UNAUTHORIZED', 'Access token is missing or malformed');
     return;
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret') as any;
+    const secret = process.env.JWT_SECRET || 'access_secret_key_2026';
+    const decoded = jwt.verify(token, secret) as JwtPayload;
     req.user = decoded;
     next();
-  } catch (err) {
-    res.status(403).json({ error: 'Invalid or expired token' });
+  } catch {
+    sendError(res, 401, 'INVALID_TOKEN', 'Token is invalid or expired');
   }
 };
 
-export const authorizeRoles = (...allowedRoles: string[]) => {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    if (!req.user || !allowedRoles.includes(req.user.role)) {
-      res.status(403).json({ error: 'Forbidden: Insufficient privileges' });
-      return;
-    }
-    next();
-  };
-};
+// Alias export for backward compatibility
+export const authMiddleware = authenticate;
